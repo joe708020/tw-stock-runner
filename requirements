@@ -1,0 +1,7 @@
+requests
+beautifulsoup4
+pytz
+yfinance
+pandas
+gspread
+google-auth
