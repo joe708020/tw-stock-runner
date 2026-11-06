@@ -6,6 +6,7 @@
   1.【大盤四象限診斷】 2.【🛡️ 現有庫存健檢】 3.【🏆 明日新標的推薦】 4.【🚨 主力倒貨警戒區】
 
 升級：動態全市場股票池 + 真實三大法人籌碼（TWSE T86 / TPEx）。
+新增：落底止跌（紫燈）判定 —— 雙指數破線但負乖離過大 + 長下影線 → 破底翻試單機制。
 
 必要環境變數：
   LINE_TOKEN                    LINE Messaging API Channel Access Token
@@ -41,7 +42,7 @@ SHEET_WORKSHEET = os.environ.get("SHEET_WORKSHEET", "").strip()
 
 MAX_HOLDINGS = 5          # 庫存達此檔數 → 停止推播新標的
 MAX_NEW_PICKS = 6         # 新標的推播絕對上限
-QUOTA_MAP = {"GREEN": 10, "BLUE": 6, "YELLOW": 1, "RED": 0}  # 燈號配額（再與 MAX_NEW_PICKS 取小）
+QUOTA_MAP = {"GREEN": 10, "BLUE": 6, "YELLOW": 1, "PURPLE": 1, "RED": 0}  # 燈號配額（再與 MAX_NEW_PICKS 取小）
 
 POS_WORDS = ['噴', '多', '賺', '目標價', '買', '加碼', '歐印', 'all in', '財富自由',
              '舒服', '漲停', '進場', '抄底', '紅']
@@ -390,7 +391,7 @@ def get_holdings():
 
 # ====================== 大盤四象限 ======================
 def fetch_index_metrics(ticker):
-    """下載指數日 K，計算收盤、漲跌幅、5/10/20MA 與均線狀態描述"""
+    """下載指數日 K，計算收盤、漲跌幅、5/10/20MA、均線狀態描述、20日乖離率與下影線比例"""
     df = download_daily(ticker, days=65)
     if df is None or len(df) < 25:
         return None
@@ -408,6 +409,20 @@ def fetch_index_metrics(ticker):
     ma20 = float(close.rolling(20).mean().iloc[-1])
     is_ma10_down = ma10 < ma10_prev
 
+    # 20日乖離率（%）
+    bias_20 = round((c_close - ma20) / ma20 * 100, 2)
+
+    # 最後一根 K 棒的下影線比例：(min(Open, Close) - Low) / (High - Low)
+    last = df.iloc[-1]
+    k_open = float(last["Open"])
+    k_high = float(last["High"])
+    k_low = float(last["Low"])
+    k_range = k_high - k_low
+    if k_range > 0:
+        lower_shadow_ratio = round((min(k_open, c_close) - k_low) / k_range, 4)
+    else:
+        lower_shadow_ratio = 0.0  # 一字線/無振幅，視為無下影線
+
     if c_close >= ma5 and c_close >= ma10 and c_close >= ma20:
         status_str = "站穩 5/10/20MA 多頭攻擊"
     elif c_close >= ma10 and c_close >= ma20:
@@ -421,6 +436,8 @@ def fetch_index_metrics(ticker):
         "close": c_close, "pct": pct,
         "ma5": ma5, "ma10": ma10, "ma20": ma20,
         "is_ma10_down": is_ma10_down,
+        "bias_20": bias_20,
+        "lower_shadow_ratio": lower_shadow_ratio,
         "strong": (c_close >= ma10 and c_close >= ma20),
         "broken": ((c_close < ma10 and is_ma10_down) or (c_close < ma20)),
         "below_ma5": (c_close < ma5),
@@ -429,7 +446,7 @@ def fetch_index_metrics(ticker):
 
 
 def get_market_stage():
-    """【第 0 層】雙指數四象限總開關，回傳 (燈號, 診斷文字)"""
+    """【第 0 層】雙指數四象限總開關（含落底止跌紫燈），回傳 (燈號, 診斷文字)"""
     try:
         tw = fetch_index_metrics("^TWII")
         otc = fetch_index_metrics("^TWOII")
@@ -446,6 +463,18 @@ def get_market_stage():
         )
 
         if tw["broken"] and otc["broken"]:
+            # 紫燈：雙指數破線，但任一指數出現「負乖離過大 + 長下影線」→ 落底止跌試單
+            is_purple = any(
+                m["bias_20"] < -7 and m["lower_shadow_ratio"] > 0.6
+                for m in (tw, otc)
+            )
+            if is_purple:
+                return "PURPLE", (
+                    f"🟣【紫燈：極度超跌｜主力換手試單區】大盤負乖離過大且出現長下影線。"
+                    f"啟動極端反彈試單機制，嚴格限制推播 1 檔。\n{summary}\n"
+                    f"📉 乖離/下影線：加權 {tw['bias_20']}% / {tw['lower_shadow_ratio']}｜"
+                    f"櫃買 {otc['bias_20']}% / {otc['lower_shadow_ratio']}"
+                )
             return "RED", (
                 f"🔴【紅燈：覆巢之下｜雙指數破線修正段】\n{summary}\n"
                 f"💡 系統決策：內外資同步撤退、系統性風險高！強制關閉個股推播（上限 0 檔），建議保留 100% 現金空手觀望！"
@@ -581,7 +610,7 @@ def scan_candidates(market_stage, stock_names, exclude_codes=()):
 def check_holdings(holdings, market_stage, ptt_map, stock_names):
     """依 PRD 規則產生庫存健檢文字區塊（list[str]）"""
     lines = []
-    weak_market = market_stage in ("YELLOW", "RED")
+    weak_market = market_stage in ("YELLOW", "RED", "PURPLE")
 
     for i, h in enumerate(holdings, 1):
         code = h["code"]
@@ -608,7 +637,7 @@ def check_holdings(holdings, market_stage, ptt_map, stock_names):
             flags.append(
                 f"[🚨 持股恐慌警戒] PTT哀號，死守原始停損價 {stop_str} 元，沒破不賣！"
             )
-        # 規則 3-1：大盤 YELLOW / RED → 停損上調至今日最低價
+        # 規則 3-1：大盤 YELLOW / RED / PURPLE → 停損上調至今日最低價
         elif weak_market:
             low_str = f"{today_low:g}" if today_low is not None else "(今日最低價取得失敗)"
             flags.append(
@@ -743,9 +772,15 @@ def main():
     elif stage == "RED":
         out.append("💡 風控紀律：大盤處於覆巢之下修正期，已全面暫停多單推薦，嚴禁逆勢接刀。")
     elif not picks:
-        reason = ("拉積盤或短線洗盤期間，無標的符合極限防禦門檻。" if stage == "YELLOW"
-                  else "今日無標的通過嚴格多因子共振健檢。")
+        if stage == "YELLOW":
+            reason = "拉積盤或短線洗盤期間，無標的符合極限防禦門檻。"
+        elif stage == "PURPLE":
+            reason = "大盤雖現落底跡象，但無標的符合極端反彈試單門檻。"
+        else:
+            reason = "今日無標的通過嚴格多因子共振健檢。"
         out.append(f"💡 今日選股結果：{reason}建議空手觀望。")
+        if stage == "PURPLE":
+            out.append("💡 風控紀律：目前為破底翻試單，建議動用單筆資金即可（最多握有1檔），若隔日跌破今日低點請無條件停損。")
     else:
         for rank, s in enumerate(picks, 1):
             out.append(f"第 {rank} 名：{s['code']} {s['name']} [{s['market_tag']}] (收 {s['close']}, {s['pct']}%)")
@@ -755,6 +790,8 @@ def main():
             out.append(f"  🎯 目標停利：{s['target']}")
             out.append("")
         out.append("💡 風控提醒：隔日開盤直接跳空大漲 >2% 或未過突破價皆放棄不追；同時持股以 5 檔為限。")
+        if stage == "PURPLE":
+            out.append("💡 風控紀律：目前為破底翻試單，建議動用單筆資金即可（最多握有1檔），若隔日跌破今日低點請無條件停損。")
     out += [SEP, ""]
 
     # 4. 主力倒貨警戒區
